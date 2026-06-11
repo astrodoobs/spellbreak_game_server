@@ -5,6 +5,7 @@ cd /spellbreak-server
 PATCH_ENV=${PATCH_ENV:-prod}
 PATCH_DIR="/spellbreak-server/BaseServer/g3/Content/Paks"
 mkdir -p "$PATCH_DIR"
+mkdir -p /spellbreak-server/data
 
 if [ "$PATCH_ENV" = "vanilla" ]; then
     echo "[entrypoint] Skipping patch (PATCH_ENV=vanilla)"
