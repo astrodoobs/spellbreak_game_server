@@ -98,7 +98,7 @@ UNBAN_USER <username>
 BAN_IP <ip> [reason]
 UNBAN_IP <ip>
 BANS                            list active bans
-REGISTER <discord_id> <username>   create account + token
+REGISTER <discord_id> <username>   create account + token (username: alphanumeric, spaces, `'._-`, max 20 chars)
 ROTATE_TOKEN <discord_id>          replace token
 DELETE_REGISTRATION <discord_id>   remove account + tokens
 LOOKUP_DISCORD <discord_id>        look up account by Discord ID
