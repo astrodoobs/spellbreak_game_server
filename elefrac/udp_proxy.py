@@ -117,10 +117,14 @@ class ProxyProtocol(asyncio.DatagramProtocol):
 
         if addr in self._sessions:
             session = self._sessions[addr]
+            if session.kicked:
+                return
             if is_join_packet(data):
                 if session.user_id is None:
                     # Not yet identified — scan for join URL and resolve identity.
                     data = await self._identify_session(session, data, ip)
+                    if session.kicked:
+                        return
                 elif not session.uid_auth and session.username != 'unknown':
                     # Legacy name-field auth: rewrite retransmissions so the game
                     # server always sees the registered name, not the raw token.
@@ -152,43 +156,52 @@ class ProxyProtocol(asyncio.DatagramProtocol):
         self, session: Session, data: bytes, ip: str
     ) -> bytes:
         """Resolve identity from a late-arriving join packet for an unidentified session."""
+        is_staff = False
+        is_dev = False
+
         # ── UID-field auth (preferred) ────────────────────────────────────────
         uid_token = extract_auth_uid_token(data)
         if uid_token:
             row = await self._db.validate_token(uid_token)
             if row is None:
                 log.info('Unknown UID token from %s: %.8s…', ip, uid_token)
-                session.kicked = True
-                return data
+                if self._cfg.require_auth:
+                    session.kicked = True
+                    return data
+            else:
+                steam_name, _, _, _ = extract_name(data)
+                if not steam_name or steam_name.lower() != row['username'].lower():
+                    log.info(
+                        'Name mismatch from %s: got %r expected %r — dropped',
+                        ip, steam_name, row['username'],
+                    )
+                    session.kicked = True
+                    return data
 
-            steam_name, _, _, _ = extract_name(data)
-            if not steam_name or steam_name.lower() != row['username'].lower():
-                log.info(
-                    'Name mismatch from %s: got %r expected %r — dropped',
-                    ip, steam_name, row['username'],
-                )
-                session.kicked = True
-                return data
+                banned, reason = await self._bans.is_banned(ip, row['user_id'])
+                if banned:
+                    log.info('Rejected banned account %s (%s) from %s', row['username'], reason, ip)
+                    session.kicked = True
+                    return data
 
-            banned, reason = await self._bans.is_banned(ip, row['user_id'])
-            if banned:
-                log.info('Rejected banned account %s (%s) from %s', row['username'], reason, ip)
-                session.kicked = True
-                return data
-
-            # Name field untouched — Steam name passes through unchanged.
-            session.username = row['username']
-            session.user_id = row['user_id']
-            session.authenticated = True
-            session.uid_auth = True
-            log.info('Auth OK (UID): %s (%.8s…) from %s', session.username, uid_token, ip)
-            await self._db.update_player_ip(session.user_id, ip)
-            # Fall through to IDENTIFIED log below.
+                # Name field untouched — Steam name passes through unchanged.
+                session.username = row['username']
+                session.user_id = row['user_id']
+                session.authenticated = True
+                session.uid_auth = True
+                is_staff = bool(row['is_staff'])
+                is_dev   = bool(row['is_dev'])
+                log.info('Auth OK (UID): %s (%.8s…) from %s', session.username, uid_token, ip)
+                await self._db.update_player_ip(session.user_id, ip)
+                # Fall through to IDENTIFIED log below.
 
         if not session.authenticated:
             # ── Name-field auth fallback (legacy / unauthenticated) ──────────
             token, name_start, name_end, name_encoded = extract_name(data)
             if not token:
+                if self._cfg.require_auth:
+                    log.info('No token in join packet from %s — dropped (require_auth)', ip)
+                    session.kicked = True
                 return data
 
             row = await self._db.validate_token(token)
@@ -202,6 +215,8 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                 session.username = row['username']
                 session.user_id = row['user_id']
                 session.authenticated = True
+                is_staff = bool(row['is_staff'])
+                is_dev   = bool(row['is_dev'])
                 log.info('Auth OK (name): %s (%.8s…) from %s', session.username, token, ip)
                 uid = extract_uid(data)
                 if uid:
@@ -209,6 +224,11 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                     await self._db.update_player_uid(session.user_id, uid, ip)
                 else:
                     await self._db.update_player_ip(session.user_id, ip)
+
+            elif self._cfg.require_auth:
+                log.info('Invalid token from %s: %.8s… — dropped (require_auth)', ip, token)
+                session.kicked = True
+                return data
 
             elif not self._cfg.require_auth:
                 uid = extract_uid(data)
@@ -234,6 +254,14 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                     session.connection_id, session.user_id, session.username
                 )
 
+        # Send dev-menu access flags now that identity is resolved.
+        if session.authenticated and self._transport:
+            cf = 't' if is_staff else 'f'
+            df = 't' if is_dev else 'f'
+            ef_pkt = f'EF_AUTH:{cf}:{df}:{session.username}'.encode()
+            self._transport.sendto(ef_pkt, session.client_addr)
+            log.debug('EF_AUTH:%s:%s → %s (%s)', cf, df, session.username, ip)
+
         return data
 
     async def _open_session(self, data: bytes, addr: ClientAddr) -> Optional[bytes]:
@@ -243,6 +271,8 @@ class ProxyProtocol(asyncio.DatagramProtocol):
         user_id = None
         uid = None
         authenticated = False
+        is_staff = False
+        is_dev = False
 
         uid_auth = False
         if is_join_packet(data):
@@ -252,28 +282,31 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                 row = await self._db.validate_token(uid_token)
                 if row is None:
                     log.info('Unknown UID token from %s: %.8s…', ip, uid_token)
-                    return None
+                    if self._cfg.require_auth:
+                        return None
+                else:
+                    steam_name, _, _, _ = extract_name(data)
+                    if not steam_name or steam_name.lower() != row['username'].lower():
+                        log.info(
+                            'Name mismatch from %s: got %r expected %r — dropped',
+                            ip, steam_name, row['username'],
+                        )
+                        return None
 
-                steam_name, _, _, _ = extract_name(data)
-                if not steam_name or steam_name.lower() != row['username'].lower():
-                    log.info(
-                        'Name mismatch from %s: got %r expected %r — dropped',
-                        ip, steam_name, row['username'],
-                    )
-                    return None
+                    banned, reason = await self._bans.is_banned(ip, row['user_id'])
+                    if banned:
+                        log.info('Rejected banned account %s (%s) from %s', row['username'], reason, ip)
+                        return None
 
-                banned, reason = await self._bans.is_banned(ip, row['user_id'])
-                if banned:
-                    log.info('Rejected banned account %s (%s) from %s', row['username'], reason, ip)
-                    return None
-
-                # Name field untouched — Steam name propagates unchanged.
-                username = row['username']
-                user_id = row['user_id']
-                authenticated = True
-                uid_auth = True
-                log.info('Auth OK (UID): %s (%.8s…) from %s', username, uid_token, ip)
-                await self._db.update_player_ip(user_id, ip)
+                    # Name field untouched — Steam name propagates unchanged.
+                    username = row['username']
+                    user_id = row['user_id']
+                    authenticated = True
+                    uid_auth = True
+                    is_staff = bool(row['is_staff'])
+                    is_dev   = bool(row['is_dev'])
+                    log.info('Auth OK (UID): %s (%.8s…) from %s', username, uid_token, ip)
+                    await self._db.update_player_ip(user_id, ip)
 
             if not authenticated:
                 # ── Name-field auth fallback (legacy / unauthenticated) ───────
@@ -291,6 +324,8 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                         username = row['username']
                         user_id = row['user_id']
                         authenticated = True
+                        is_staff = bool(row['is_staff'])
+                        is_dev   = bool(row['is_dev'])
                         log.info('Auth OK (name): %s (%.8s…) from %s', username, token, ip)
                         uid = extract_uid(data)
                         if uid:
@@ -316,6 +351,15 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                 elif self._cfg.require_auth:
                     log.debug('No token in join packet from %s — dropped (require_auth)', ip)
                     return None
+
+        # Send dev-menu cheat-access status back to the client.  The client's
+        # auth_injector hooks recvfrom and silently absorbs this packet before
+        # the game ever sees it.
+        if authenticated and self._transport:
+            flag = 't' if is_staff else 'f'
+            ef_pkt = f'EF_AUTH:{flag}:{username}'.encode()
+            self._transport.sendto(ef_pkt, addr)
+            log.debug('EF_AUTH:%s → %s (%s)', flag, username, ip)
 
         conn_id = await self._db.log_connection(ip, username, user_id)
 

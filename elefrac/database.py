@@ -72,6 +72,8 @@ _MIGRATIONS = [
     'ALTER TABLE users ADD COLUMN ip_address TEXT',
     'ALTER TABLE users ADD COLUMN first_connection INTEGER',
     'ALTER TABLE users ADD COLUMN discord_id TEXT UNIQUE',
+    'ALTER TABLE users ADD COLUMN is_staff INTEGER NOT NULL DEFAULT 0',
+    'ALTER TABLE users ADD COLUMN is_dev   INTEGER NOT NULL DEFAULT 0',
 ]
 
 
@@ -147,6 +149,24 @@ class Database:
             'SELECT * FROM users WHERE ip_address = ? ORDER BY id ASC LIMIT 1', (ip,)
         ) as cur:
             return await cur.fetchone()
+
+    async def set_staff(self, user_id: int, is_staff: bool) -> bool:
+        """Grant or revoke staff status. Returns True if the user was found."""
+        async with self._db.execute(
+            'UPDATE users SET is_staff = ? WHERE id = ?',
+            (1 if is_staff else 0, user_id),
+        ) as cur:
+            await self._db.commit()
+            return cur.rowcount > 0
+
+    async def set_dev(self, user_id: int, is_dev: bool) -> bool:
+        """Grant or revoke dev status (also sets is_staff to match). Returns True if found."""
+        async with self._db.execute(
+            'UPDATE users SET is_dev = ?, is_staff = ? WHERE id = ?',
+            (1 if is_dev else 0, 1 if is_dev else 0, user_id),
+        ) as cur:
+            await self._db.commit()
+            return cur.rowcount > 0
 
     async def delete_user(self, user_id: int) -> bool:
         """Remove a user and all their tokens/aliases (cascaded by FK)."""
@@ -308,7 +328,7 @@ class Database:
         injected prefix.
         """
         async with self._db.execute(
-            '''SELECT u.id AS user_id, u.username, u.discord_id
+            '''SELECT u.id AS user_id, u.username, u.discord_id, u.is_staff, u.is_dev
                FROM tokens t JOIN users u ON t.user_id = u.id
                WHERE t.token LIKE ? || '%'
                ORDER BY length(t.token) ASC

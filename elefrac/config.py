@@ -1,4 +1,16 @@
 import configparser
+import os
+
+
+_TRUE_VALS  = {'1', 'true',  'yes', 'on'}
+_FALSE_VALS = {'0', 'false', 'no',  'off'}
+
+def _env_bool(name: str):
+    """Return True/False if the env var is set to a recognised value, else None."""
+    val = os.environ.get(name, '').strip().lower()
+    if val in _TRUE_VALS:  return True
+    if val in _FALSE_VALS: return False
+    return None
 
 
 class Config:
@@ -31,7 +43,9 @@ class Config:
     @property
     def session_timeout(self):  return self._i('Proxy', 'session_timeout', 120)
     @property
-    def require_auth(self):     return self._b('Proxy', 'require_auth', True)
+    def require_auth(self):
+        env = _env_bool('REQUIRE_AUTH')
+        return env if env is not None else self._b('Proxy', 'require_auth', True)
 
     # Database
     @property

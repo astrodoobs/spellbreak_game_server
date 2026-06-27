@@ -18,6 +18,10 @@ Standard commands:
     BANS                          — list all active bans
     REGISTER <discord_id> <username> — create user + persistent 64-char token; returns {"ok":true,"token":"..."}
     ROTATE_TOKEN <discord_id>    — replace token for existing user; returns {"ok":true,"token":"..."}
+    GRANT_STAFF <discord_id>     — set is_staff=true; client dev menu unlocks cheat commands on next connect
+    REVOKE_STAFF <discord_id>    — set is_staff=false; takes effect on next connect
+    GRANT_DEV <discord_id>       — set is_dev=true + is_staff=true; unlocks Dev Settings panel on next connect
+    REVOKE_DEV <discord_id>      — set is_dev=false + is_staff=false; takes effect on next connect
     RESTART                       — request game server restart
     QUIT
 
@@ -323,6 +327,36 @@ class ControlServer:
                         await reply({'ok': False, 'error': 'not_registered'})
                         continue
                     await reply({'ok': True, 'user': dict(user)})
+
+                elif cmd in ('GRANT_STAFF', 'REVOKE_STAFF'):
+                    # GRANT_STAFF <discord_id> / REVOKE_STAFF <discord_id>
+                    discord_id = parts[1] if len(parts) > 1 else ''
+                    if not discord_id:
+                        await reply({'ok': False, 'error': 'discord_id required'})
+                        continue
+                    user = await self._db.get_user_by_discord_id(discord_id)
+                    if not user:
+                        await reply({'ok': False, 'error': 'not_registered'})
+                        continue
+                    granting = cmd == 'GRANT_STAFF'
+                    await self._db.set_staff(user['id'], granting)
+                    log.info('%s discord=%s username=%s', cmd, discord_id, user['username'])
+                    await reply({'ok': True, 'username': user['username'], 'is_staff': granting})
+
+                elif cmd in ('GRANT_DEV', 'REVOKE_DEV'):
+                    # GRANT_DEV <discord_id> / REVOKE_DEV <discord_id>
+                    discord_id = parts[1] if len(parts) > 1 else ''
+                    if not discord_id:
+                        await reply({'ok': False, 'error': 'discord_id required'})
+                        continue
+                    user = await self._db.get_user_by_discord_id(discord_id)
+                    if not user:
+                        await reply({'ok': False, 'error': 'not_registered'})
+                        continue
+                    granting = cmd == 'GRANT_DEV'
+                    await self._db.set_dev(user['id'], granting)
+                    log.info('%s discord=%s username=%s', cmd, discord_id, user['username'])
+                    await reply({'ok': True, 'username': user['username'], 'is_dev': granting, 'is_staff': granting})
 
                 else:
                     await reply({'ok': False, 'error': f'unknown command: {cmd}'})
