@@ -471,13 +471,17 @@ class ProxyProtocol(asyncio.DatagramProtocol):
             await self._match_state.player_disconnected(session.username)
 
     async def run_cleanup_loop(self) -> None:
+        combined = self._cfg.combined_silence_timeout
+        client   = self._cfg.client_silence_timeout
+        full     = self._cfg.session_timeout
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
             now = time.monotonic()
             stale = [
                 addr for addr, s in self._sessions.items()
-                if now - s.last_seen > self._cfg.session_timeout
-                or now - s.client_last_seen > self._cfg.client_silence_timeout
+                if now - s.last_seen        > full      # both sides dead for 10 min
+                or now - s.client_last_seen > client    # client silent for 3 min
+                or now - s.last_seen        > combined  # both sides quiet for 45s
             ]
             for addr in stale:
                 await self._close_session(addr)
