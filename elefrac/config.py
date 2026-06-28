@@ -41,7 +41,11 @@ class Config:
     @property
     def game_port(self):        return self._i('Proxy', 'game_port', 7777)
     @property
-    def session_timeout(self):  return self._i('Proxy', 'session_timeout', 120)
+    def session_timeout(self):
+        env = os.environ.get('SESSION_TIMEOUT', '').strip()
+        if env.isdigit():
+            return int(env)
+        return self._i('Proxy', 'session_timeout', 600)
     @property
     def require_auth(self):
         env = _env_bool('REQUIRE_AUTH')

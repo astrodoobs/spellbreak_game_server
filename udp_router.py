@@ -18,6 +18,8 @@ import asyncio
 import logging
 import os
 import time
+import urllib.request
+import json
 from typing import Optional
 
 log = logging.getLogger('router')
@@ -31,6 +33,10 @@ REDIRECT_BUFFER = int(os.environ.get('REDIRECT_BUFFER', '60'))
 
 MODE_PREF_TTL = float(os.environ.get('MODE_PREF_TTL', '30'))
 
+# When MANAGER_URL is set, all backend selection goes through the server manager.
+# Without it, falls back to the hardcoded dict below (standalone / testing mode).
+MANAGER_URL = os.environ.get('MANAGER_URL', '').rstrip('/')
+
 _BACKENDS: dict[str, tuple[str, int]] = {
     's': (os.environ.get('SOLO_HOST',  'solo-dev-1'),   int(os.environ.get('SOLO_PORT',  '7777'))),
     'd': (os.environ.get('SOLO_HOST',  'solo-dev-1'),   int(os.environ.get('SOLO_PORT',  '7777'))),
@@ -38,6 +44,33 @@ _BACKENDS: dict[str, tuple[str, int]] = {
     'c': (os.environ.get('ARENA_HOST', 'arenas-dev-1'), int(os.environ.get('ARENA_PORT', '7777'))),
 }
 _DEFAULT_BACKEND = _BACKENDS['s']
+
+
+async def _fetch_backend(mode: str) -> tuple[str, int]:
+    """Ask the server manager which backend to use, and increment its session counter."""
+    url = f'{MANAGER_URL}/backend?mode={mode}'
+    loop = asyncio.get_running_loop()
+    def _get():
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return json.loads(resp.read())
+    data = await loop.run_in_executor(None, _get)
+    return (data['host'], int(data['port']))
+
+
+async def _notify_close(backend: tuple[str, int]) -> None:
+    """Tell the server manager a session has ended."""
+    url = f'{MANAGER_URL}/session/close'
+    body = json.dumps({'host': backend[0], 'port': backend[1]}).encode()
+    loop = asyncio.get_running_loop()
+    def _post():
+        req = urllib.request.Request(url, data=body,
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    try:
+        await loop.run_in_executor(None, _post)
+    except Exception as exc:
+        log.warning('session/close notify failed: %s', exc)
 
 # ── Packet inspection ─────────────────────────────────────────────────────────
 
@@ -96,6 +129,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: ClientAddr) -> None:
         log.debug('BACKEND→CLIENT %s  %d bytes', self._client[0], len(data))
+        self._router.refresh_session(self._client)
         self._router.send_to_client(self._client, data)
 
     def error_received(self, exc: Exception) -> None:
@@ -142,6 +176,11 @@ class RouterProtocol(asyncio.DatagramProtocol):
                 log.info('  %s → %s:%d', ch, *backend)
                 logged.add(backend)
 
+    def refresh_session(self, addr: ClientAddr) -> None:
+        sess = self._sessions.get(addr)
+        if sess:
+            sess.last_seen = time.monotonic()
+
     def send_to_client(self, addr: ClientAddr, data: bytes) -> None:
         if self._transport:
             log.debug('FORWARD→CLIENT %s  %d bytes', addr[0], len(data))
@@ -181,9 +220,11 @@ class RouterProtocol(asyncio.DatagramProtocol):
                             'REDIRECT %-20s  mode=%s  %s:%d → %s:%d',
                             addr[0], mode, *sess.backend, *target,
                         )
-                        # Close wrong upstream, open correct one, replay buffer.
+                        # Close wrong upstream, notify manager, open correct one.
                         if sess.upstream.transport:
                             sess.upstream.transport.close()
+                        if MANAGER_URL:
+                            asyncio.ensure_future(_notify_close(sess.backend))
                         buf = list(sess.buf)
                         del self._sessions[addr]
                         asyncio.ensure_future(self._open(addr, target, buf))
@@ -207,7 +248,15 @@ class RouterProtocol(asyncio.DatagramProtocol):
                 mode = stored[0]
             else:
                 mode = 's'
-            await self._open(addr, _BACKENDS.get(mode, _DEFAULT_BACKEND), [data])
+            if MANAGER_URL:
+                try:
+                    backend = await _fetch_backend(mode)
+                except Exception as exc:
+                    log.error('Manager unreachable, falling back to hardcoded: %s', exc)
+                    backend = _BACKENDS.get(mode, _DEFAULT_BACKEND)
+            else:
+                backend = _BACKENDS.get(mode, _DEFAULT_BACKEND)
+            await self._open(addr, backend, [data])
         finally:
             self._pending.discard(addr)
 
@@ -246,6 +295,8 @@ class RouterProtocol(asyncio.DatagramProtocol):
                 sess = self._sessions.pop(addr)
                 if sess.upstream.transport:
                     sess.upstream.transport.close()
+                if MANAGER_URL:
+                    asyncio.ensure_future(_notify_close(sess.backend))
             if stale:
                 log.info('Expired %d idle sessions', len(stale))
 

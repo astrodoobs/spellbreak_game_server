@@ -63,6 +63,7 @@ class UpstreamProtocol(asyncio.DatagramProtocol):
         self.transport = transport
 
     def datagram_received(self, data: bytes, addr: ClientAddr) -> None:
+        self._proxy.refresh_session(self._client)
         self._proxy.send_to_client(self._client, data)
 
     def error_received(self, exc: Exception) -> None:
@@ -99,6 +100,11 @@ class ProxyProtocol(asyncio.DatagramProtocol):
             self._cfg.game_host,
             self._cfg.game_port,
         )
+
+    def refresh_session(self, client_addr: ClientAddr) -> None:
+        session = self._sessions.get(client_addr)
+        if session:
+            session.last_seen = time.monotonic()
 
     def send_to_client(self, client_addr: ClientAddr, data: bytes) -> None:
         if self._transport:
