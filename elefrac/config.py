@@ -72,11 +72,9 @@ class Config:
 
     # MatchTracker
     @property
-    def tracker_state_file(self):       return self._s('MatchTracker', 'state_file', '')
-    @property
     def tracker_port(self):             return self._i('MatchTracker', 'port', 4951)
     @property
-    def tracker_poll_interval(self):    return self._f('MatchTracker', 'poll_interval', 2.0)
+    def tracker_push_port(self):        return self._i('MatchTracker', 'push_port', 4950)
 
     # Broadcast
     @property

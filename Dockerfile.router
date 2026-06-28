@@ -1,0 +1,4 @@
+FROM python:3.12-slim
+WORKDIR /app
+COPY udp_router.py .
+CMD ["python3", "-u", "udp_router.py"]

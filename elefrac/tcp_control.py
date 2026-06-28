@@ -6,6 +6,7 @@ with AUTH before any other command (unless control_password is empty).
 
 Standard commands:
     AUTH <password>
+    GET_PLAYERS                   — match state JSON (same format as match_tracker.dll port 4951)
     STATUS                        — server + match state summary
     PLAYERS                       — live proxy connection list
     KICK <username>               — drop a player from the proxy
@@ -26,10 +27,10 @@ Standard commands:
     QUIT
 
 Legacy Elixir-compatible commands (accepted without response wait):
-    CMD_REFRESH                   — clear all UDP sessions
-    BOT_REFRESH                   — alias for CMD_REFRESH
-    MATCH_COMPLETE                — alias for CMD_REFRESH
-    PURGE_CONNECTIONS             — alias for CMD_REFRESH
+    CMD_REFRESH                   — no-op (push model keeps state current)
+    BOT_REFRESH                   — no-op (same)
+    MATCH_COMPLETE                — clear all UDP sessions
+    PURGE_CONNECTIONS             — clear all UDP sessions
     RESTART_MATCHMAKING           — clear sessions + restart game server
 
 Responses are JSON objects, one per line: {"ok": true, ...} or {"ok": false, "error": "..."}.
@@ -133,7 +134,12 @@ class ControlServer:
                     continue
 
                 # ── Legacy Elixir-compatible commands (no auth required if password empty) ──
-                if cmd in ('CMD_REFRESH', 'BOT_REFRESH', 'MATCH_COMPLETE', 'PURGE_CONNECTIONS'):
+                if cmd in ('CMD_REFRESH', 'BOT_REFRESH'):
+                    # No-op: push model keeps state current without clearing sessions.
+                    log.info('Legacy command %s from %s (no-op)', cmd, addr)
+                    await reply({'ok': True})
+
+                elif cmd in ('MATCH_COMPLETE', 'PURGE_CONNECTIONS'):
                     log.info('Legacy command %s from %s', cmd, addr)
                     if self._proxy:
                         await self._proxy.clear_all_sessions()
@@ -148,6 +154,14 @@ class ControlServer:
                     await reply({'ok': True})
 
                 # ── Standard commands ──────────────────────────────────────────
+                elif cmd == 'GET_PLAYERS':
+                    # Same JSON format as match_tracker.dll port 4951 — for bot compatibility.
+                    try:
+                        writer.write(self._state.state.to_json().encode() + b'\n')
+                        await writer.drain()
+                    except Exception:
+                        pass
+
                 elif cmd == 'STATUS':
                     s = self._state.state
                     conns = self._proxy.get_connected_players() if self._proxy else []

@@ -30,7 +30,7 @@ from typing import Optional
 from .ban_handler import BanHandler
 from .config import Config
 from .database import Database
-from .packet_parser import extract_auth_uid_token, extract_name, extract_uid, is_join_packet, rewrite_name
+from .packet_parser import decode_join_url, extract_auth_uid_token, extract_name, extract_uid, is_join_packet, rewrite_name
 
 log = logging.getLogger(__name__)
 
@@ -159,6 +159,9 @@ class ProxyProtocol(asyncio.DatagramProtocol):
         is_staff = False
         is_dev = False
 
+        join_url = decode_join_url(data)
+        log.info('JOIN URL (identify) from %s: %s', ip, join_url)
+
         # ── UID-field auth (preferred) ────────────────────────────────────────
         uid_token = extract_auth_uid_token(data)
         if uid_token:
@@ -253,6 +256,7 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                 await self._db.update_connection_user(
                     session.connection_id, session.user_id, session.username
                 )
+            await self._match_state.player_connected(session.username, session.user_id)
 
         # Send dev-menu access flags now that identity is resolved.
         if session.authenticated and self._transport:
@@ -276,6 +280,8 @@ class ProxyProtocol(asyncio.DatagramProtocol):
 
         uid_auth = False
         if is_join_packet(data):
+            join_url = decode_join_url(data)
+            log.info('JOIN URL from %s: %s', ip, join_url)
             # ── UID-field auth (preferred) ────────────────────────────────────
             uid_token = extract_auth_uid_token(data)
             if uid_token:
@@ -388,6 +394,9 @@ class ProxyProtocol(asyncio.DatagramProtocol):
         id_tag = f' id={user_id}' if user_id else ''
         log.info('CONNECT  %-20s  %-24s  [%s]%s%s', ip, username, auth_tag, id_tag, uid_tag)
 
+        if user_id is not None:
+            await self._match_state.player_connected(username, user_id)
+
         return data
 
     def _forward(self, data: bytes, addr: ClientAddr) -> None:
@@ -449,6 +458,8 @@ class ProxyProtocol(asyncio.DatagramProtocol):
         duration = int(time.monotonic() - session.last_seen)
         id_tag = f' id={session.user_id}' if session.user_id else ''
         log.info('DISCONNECT %-20s  %-24s  idle=%ds%s', addr[0], session.username, duration, id_tag)
+        if session.user_id is not None:
+            await self._match_state.player_disconnected(session.username)
 
     async def run_cleanup_loop(self) -> None:
         while True:

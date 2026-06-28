@@ -59,6 +59,7 @@ async def _main() -> None:
     try:
         await asyncio.gather(
             supervisor.start(),
+            supervisor.listen_for_tracker(),
             broadcast.start(),
             control.start(),
             supervisor.run_idle_watchdog(),

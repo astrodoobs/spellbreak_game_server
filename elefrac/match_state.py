@@ -86,41 +86,85 @@ class MatchStateManager:
 
     # ── State mutations ───────────────────────────────────────────────────────
 
-    async def update_from_tracker(self, data: dict) -> None:
+    async def player_connected(self, username: str, player_id: int = 0) -> None:
+        """Called by the UDP proxy when a player session is opened."""
         async with self._lock:
-            prev_players = {p.username for p in self._state.players}
-            new_status = data.get('state', self._state.status)
-            raw = data.get('players', [])
-            new_players = [
-                Player(
-                    username=p['username'],
-                    player_id=p.get('id', 0),
-                    ping=p.get('ping', 0),
-                    is_bot=p.get('is_bot', False),
-                    is_spectator=p.get('is_spectator', False),
-                )
-                for p in raw
-            ]
-            new_usernames = {p.username for p in new_players}
-
-            if new_status == 'InProgress' and self._state.status != 'InProgress':
-                self._state.match_started_at = time.time()
-
-            changed = (new_status != self._state.status or new_usernames != prev_players)
-            self._state.status = new_status
-            self._state.players = new_players
+            if any(p.username == username for p in self._state.players):
+                return
+            # If the server is still in WaitingForServer when a player connects,
+            # the ready log line was missed — advance the status.
+            if self._state.status == 'WaitingForServer':
+                self._state.status = 'WaitingForPlayers'
+            self._state.players.append(
+                Player(username=username, player_id=player_id, ping=0, is_bot=False)
+            )
             self._state.last_updated = time.time()
+        self._fire_state_change()
+        for cb in self._on_player_join:
+            asyncio.ensure_future(cb(username))
+
+    async def player_disconnected(self, username: str) -> None:
+        """Called by the UDP proxy when a player session closes."""
+        async with self._lock:
+            before = len(self._state.players)
+            self._state.players = [p for p in self._state.players if p.username != username]
+            if len(self._state.players) == before:
+                return
+            self._state.last_updated = time.time()
+        self._fire_state_change()
+        for cb in self._on_player_leave:
+            asyncio.ensure_future(cb(username))
+
+    async def set_match_started(self) -> None:
+        async with self._lock:
+            if self._state.status == 'InProgress':
+                return
+            self._state.status = 'InProgress'
+            self._state.match_started_at = time.time()
+            self._state.last_updated = time.time()
+        log.info('Match started')
+        self._fire_state_change()
+
+    async def update_from_tracker(self, data: dict) -> None:
+        """Merge richer DLL data (ping, spectator, bot) without overriding proxy player list."""
+        async with self._lock:
+            changed = False
+            new_status = data.get('state') or ''
+            if new_status and new_status != self._state.status:
+                self._state.status = new_status
+                if new_status == 'InProgress' and not self._state.match_started_at:
+                    self._state.match_started_at = time.time()
+                changed = True
+
+            tracker_map = {p['username']: p for p in data.get('players', [])}
+
+            # Enrich existing proxy-tracked players with DLL data.
+            for player in self._state.players:
+                if player.username in tracker_map:
+                    tp = tracker_map[player.username]
+                    player.ping = tp.get('ping', player.ping)
+                    player.is_bot = tp.get('is_bot', player.is_bot)
+                    player.is_spectator = tp.get('is_spectator', player.is_spectator)
+                    changed = True
+
+            # Add any DLL-reported players the proxy hasn't seen yet.
+            existing = {p.username for p in self._state.players}
+            for username, tp in tracker_map.items():
+                if username not in existing:
+                    self._state.players.append(Player(
+                        username=username,
+                        player_id=tp.get('id', 0),
+                        ping=tp.get('ping', 0),
+                        is_bot=tp.get('is_bot', False),
+                        is_spectator=tp.get('is_spectator', False),
+                    ))
+                    changed = True
+
+            if changed:
+                self._state.last_updated = time.time()
 
         if changed:
             self._fire_state_change()
-
-        for name in new_usernames - prev_players:
-            for cb in self._on_player_join:
-                asyncio.ensure_future(cb(name))
-
-        for name in prev_players - new_usernames:
-            for cb in self._on_player_leave:
-                asyncio.ensure_future(cb(name))
 
     async def set_server_ready(self) -> None:
         async with self._lock:
@@ -144,6 +188,13 @@ class MatchStateManager:
         self._fire_state_change()
         for cb in self._on_match_end:
             asyncio.ensure_future(cb())
+
+    async def set_offline(self) -> None:
+        async with self._lock:
+            self._state.status = 'Offline'
+            self._state.players = []
+            self._state.last_updated = time.time()
+        self._fire_state_change()
 
     async def reset(self) -> None:
         async with self._lock:

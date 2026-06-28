@@ -2,8 +2,9 @@
 Game server process supervisor.
 
 Spawns the game executable (or via Wine on Linux), tails its log file for
-match events, polls the match_tracker DLL on port 4951 for player state,
-and restarts cleanly on crash, match completion, or idle timeout.
+match events, and receives pushed state from match_tracker.dll over a
+persistent TCP connection (port 4950). Restarts cleanly on crash, match
+completion, or idle timeout.
 """
 
 import asyncio
@@ -19,9 +20,10 @@ from .match_state import MatchStateManager
 
 log = logging.getLogger(__name__)
 
-_RE_READY     = re.compile(r'LogInit:Display: Game Engine Initialized')
-_RE_MATCH_END = re.compile(r'R:GameServer: The match was complete')
-_RE_MAP       = re.compile(r'LogWorld: Bringing World .*/([^/\.]+) up for play')
+_RE_READY       = re.compile(r'LogInit:Display: Game Engine Initialized')
+_RE_MATCH_START = re.compile(r'LogInteractive:.*\bOnMatchStarted\b')
+_RE_MATCH_END   = re.compile(r'R:GameServer: The match was complete')
+_RE_MAP         = re.compile(r'LogWorld: Bringing World .*/([^/\.]+) up for play')
 
 
 class GameSupervisor:
@@ -50,6 +52,44 @@ class GameSupervisor:
     def request_restart(self) -> None:
         self._restart_event.set()
 
+    # ── Tracker push listener ──────────────────────────────────────────────────
+
+    async def listen_for_tracker(self) -> None:
+        """Persistent TCP server that accepts push connections from match_tracker.dll."""
+        server = await asyncio.start_server(
+            self._handle_tracker_push,
+            '127.0.0.1',
+            self._cfg.tracker_push_port,
+        )
+        log.info('Tracker push receiver on :%d', self._cfg.tracker_push_port)
+        async with server:
+            await server.serve_forever()
+
+    async def _handle_tracker_push(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        addr = writer.get_extra_info('peername')
+        log.info('match_tracker connected from %s', addr)
+        try:
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=60.0)
+                if not line:
+                    break
+                try:
+                    data = json.loads(line.decode('utf-8'))
+                    await self._state.update_from_tracker(data)
+                except (json.JSONDecodeError, Exception) as exc:
+                    log.debug('Tracker push parse error: %s', exc)
+        except (asyncio.TimeoutError, ConnectionResetError, asyncio.IncompleteReadError, OSError):
+            pass
+        finally:
+            log.info('match_tracker disconnected from %s', addr)
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
+
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     async def _run_loop(self) -> None:
@@ -60,13 +100,13 @@ class GameSupervisor:
 
             if self._proc is None:
                 log.error('Failed to launch game server; retrying in 15s')
+                await self._state.set_offline()
                 await asyncio.sleep(15)
                 continue
 
             tasks = [
                 asyncio.ensure_future(self._watch_process()),
                 asyncio.ensure_future(self._watch_log()),
-                asyncio.ensure_future(self._poll_tracker()),
                 asyncio.ensure_future(self._restart_event.wait()),
             ]
 
@@ -89,6 +129,7 @@ class GameSupervisor:
             if not self._running:
                 break
 
+            await self._state.set_offline()
             log.info('Restarting in 5s...')
             await asyncio.sleep(5)
 
@@ -111,10 +152,11 @@ class GameSupervisor:
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
             log.info('Game server PID: %d', self._proc.pid)
+            asyncio.ensure_future(self._pipe_game_output(self._proc))
         except Exception as exc:
             log.error('Launch failed: %s', exc)
             self._proc = None
@@ -127,11 +169,21 @@ class GameSupervisor:
         code = await self._proc.wait()
         log.warning('Game server exited (code %d)', code)
 
+    async def _pipe_game_output(self, proc: asyncio.subprocess.Process) -> None:
+        """Forward game/Wine stdout lines that contain mod tags to Python logging."""
+        if proc.stdout is None:
+            return
+        try:
+            async for raw in proc.stdout:
+                line = raw.decode('utf-8', errors='replace').rstrip()
+                if '[match_tracker]' in line or '[mod_loader]' in line:
+                    log.info('[game] %s', line)
+        except (asyncio.CancelledError, Exception):
+            pass
+
     def _find_active_log(self) -> Optional[Path]:
-        """Return the most recently modified non-backup g3*.log in the log dir."""
         if not self._log_path:
             return None
-        # Prefer configured name exactly, then fall back to newest g3*.log glob.
         if self._log_path.exists():
             return self._log_path
         candidates = sorted(
@@ -145,7 +197,6 @@ class GameSupervisor:
         if not self._log_path:
             return
 
-        # Wait up to 60s for ANY matching log file to appear.
         for _ in range(60):
             if self._find_active_log():
                 break
@@ -166,7 +217,7 @@ class GameSupervisor:
                     if active:
                         log.info('Watching log: %s', active)
                         fh = active.open('r', encoding='utf-8', errors='replace')
-                        fh.seek(0, 2)  # Tail from end
+                        fh.seek(0, 2)
                         current_path = active
 
                 if fh:
@@ -187,6 +238,8 @@ class GameSupervisor:
         if _RE_READY.search(line):
             log.info('Game server ready')
             await self._state.set_server_ready()
+        elif _RE_MATCH_START.search(line):
+            await self._state.set_match_started()
         elif _RE_MATCH_END.search(line):
             log.info('Match complete (log signal)')
             await self._state.signal_match_end()
@@ -194,53 +247,6 @@ class GameSupervisor:
                 self.request_restart()
         elif m := _RE_MAP.search(line):
             await self._state.set_map_name(m.group(1))
-
-    async def _poll_tracker(self) -> None:
-        """Query match_tracker.dll (port 4951) for live player state."""
-        await asyncio.sleep(20)  # Let the server finish starting
-        while True:
-            try:
-                data = await self._query_tracker()
-                if data:
-                    await self._state.update_from_tracker(data)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                log.debug('Tracker poll error: %s', exc)
-            await asyncio.sleep(self._cfg.tracker_poll_interval)
-
-    async def _query_tracker(self) -> Optional[dict]:
-        state_file = self._cfg.tracker_state_file
-        if state_file:
-            return await self._read_state_file(state_file)
-        return await self._query_tracker_tcp()
-
-    async def _read_state_file(self, path: str) -> Optional[dict]:
-        try:
-            loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(None, Path(path).read_text, 'utf-8')
-            return json.loads(raw)
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            return None
-
-    async def _query_tracker_tcp(self) -> Optional[dict]:
-        """Fallback: original request-response TCP query on port 4951."""
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection('127.0.0.1', self._cfg.tracker_port),
-                timeout=3.0,
-            )
-            writer.write(b'get_players\n')
-            await writer.drain()
-            raw = await asyncio.wait_for(reader.read(65536), timeout=3.0)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return json.loads(raw.decode('utf-8', errors='replace'))
-        except (ConnectionRefusedError, asyncio.TimeoutError, json.JSONDecodeError):
-            return None
 
     # ── Idle watchdog ─────────────────────────────────────────────────────────
 

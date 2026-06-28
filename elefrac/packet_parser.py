@@ -93,6 +93,25 @@ def is_join_packet(data: bytes) -> bool:
     return any(m in data for m in _NAME_MARKERS) or _ENCODED_HEADER in data
 
 
+def decode_join_url(data: bytes) -> str | None:
+    """Decode the full 2x-encoded join URL for debug inspection. Returns None if not found."""
+    idx = data.find(_ENCODED_HEADER)
+    if idx == -1:
+        return None
+    segment = data[idx + len(_ENCODED_HEADER):]
+    chars = []
+    for b in segment:
+        if b == 0:
+            break
+        c = b >> 1
+        if 0x20 <= c <= 0x7E:
+            chars.append(chr(c))
+        else:
+            break
+    url = ''.join(chars)
+    return ('/Game/Maps/' + url) if url else None
+
+
 def rewrite_name(
     data: bytes,
     name_start: int,
