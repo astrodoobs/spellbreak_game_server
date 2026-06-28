@@ -38,8 +38,12 @@ async def _main() -> None:
     async def _on_state_change(data: dict) -> None:
         await broadcast.push_update(data)
 
+    async def _on_player_leave(username: str) -> None:
+        await proxy.kick_by_username(username)
+
     match_state.on_match_end(_on_match_end)
     match_state.on_state_change(_on_state_change)
+    match_state.on_player_leave(_on_player_leave)
 
     log.info('Elemental Fracture starting')
 

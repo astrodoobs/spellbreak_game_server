@@ -126,7 +126,8 @@ class MatchStateManager:
         self._fire_state_change()
 
     async def update_from_tracker(self, data: dict) -> None:
-        """Merge richer DLL data (ping, spectator, bot) without overriding proxy player list."""
+        """Merge richer DLL data (ping, spectator, bot) and reconcile disconnects."""
+        departed: list[str] = []
         async with self._lock:
             changed = False
             new_status = data.get('state') or ''
@@ -160,11 +161,25 @@ class MatchStateManager:
                     ))
                     changed = True
 
+            # When the DLL explicitly sends a player list, treat it as authoritative:
+            # remove anyone the DLL no longer reports (they disconnected on the UE4 side).
+            if 'players' in data:
+                departed = [p.username for p in self._state.players if p.username not in tracker_map]
+                if departed:
+                    gone = set(departed)
+                    self._state.players = [p for p in self._state.players if p.username not in gone]
+                    changed = True
+
             if changed:
                 self._state.last_updated = time.time()
 
         if changed:
             self._fire_state_change()
+
+        for username in departed:
+            log.info('DLL: %s left — firing disconnect', username)
+            for cb in self._on_player_leave:
+                asyncio.ensure_future(cb(username))
 
     async def set_server_ready(self) -> None:
         async with self._lock:
