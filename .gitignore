@@ -30,3 +30,6 @@ config.ini
 *.secret
 .env
 .env.*
+.binaries-downloaded
+BaseServer/Engine/
+BaseServer/g3/
