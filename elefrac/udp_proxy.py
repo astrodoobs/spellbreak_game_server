@@ -46,6 +46,7 @@ class Session:
     uid: Optional[str] = None
     upstream: 'UpstreamProtocol' = field(repr=False, default=None)
     last_seen: float = field(default_factory=time.monotonic)
+    client_last_seen: float = field(default_factory=time.monotonic)
     authenticated: bool = False
     uid_auth: bool = False   # True = authenticated via UID field; Name untouched
     kicked: bool = False
@@ -409,7 +410,9 @@ class ProxyProtocol(asyncio.DatagramProtocol):
         session = self._sessions.get(addr)
         if session is None or session.kicked:
             return
-        session.last_seen = time.monotonic()
+        now = time.monotonic()
+        session.last_seen = now
+        session.client_last_seen = now
         if session.upstream and session.upstream.transport:
             session.upstream.transport.sendto(data)
 
@@ -474,6 +477,7 @@ class ProxyProtocol(asyncio.DatagramProtocol):
             stale = [
                 addr for addr, s in self._sessions.items()
                 if now - s.last_seen > self._cfg.session_timeout
+                or now - s.client_last_seen > self._cfg.client_silence_timeout
             ]
             for addr in stale:
                 await self._close_session(addr)

@@ -47,6 +47,12 @@ class Config:
             return int(env)
         return self._i('Proxy', 'session_timeout', 600)
     @property
+    def client_silence_timeout(self):
+        env = os.environ.get('CLIENT_SILENCE_TIMEOUT', '').strip()
+        if env.isdigit():
+            return int(env)
+        return self._i('Proxy', 'client_silence_timeout', 180)
+    @property
     def require_auth(self):
         env = _env_bool('REQUIRE_AUTH')
         return env if env is not None else self._b('Proxy', 'require_auth', True)
