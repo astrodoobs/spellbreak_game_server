@@ -20,9 +20,13 @@ import os
 import time
 import urllib.request
 import json
+import aiosqlite
+import re
+import secrets
 from typing import Optional
 
 log = logging.getLogger('router')
+auth_log = logging.getLogger('auth')
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -32,6 +36,13 @@ SESSION_TIMEOUT = int(os.environ.get('SESSION_TIMEOUT', '120'))
 REDIRECT_BUFFER = int(os.environ.get('REDIRECT_BUFFER', '60'))
 
 MODE_PREF_TTL = float(os.environ.get('MODE_PREF_TTL', '30'))
+
+AUTH_HOST    = os.environ.get('AUTH_HOST',    '0.0.0.0')
+AUTH_PORT    = int(os.environ.get('AUTH_PORT',    '4948'))
+AUTH_DB      = os.environ.get('AUTH_DB',      '/data/elefrac.db')
+CONTROL_HOST = os.environ.get('CONTROL_HOST', '0.0.0.0')
+CONTROL_PORT = int(os.environ.get('CONTROL_PORT', '3387'))
+CONTROL_PASS = os.environ.get('CONTROL_PASSWORD', '')
 
 # When MANAGER_URL is set, all backend selection goes through the server manager.
 # Without it, falls back to the hardcoded dict below (standalone / testing mode).
@@ -300,6 +311,310 @@ class RouterProtocol(asyncio.DatagramProtocol):
             if stale:
                 log.info('Expired %d idle sessions', len(stale))
 
+# ── Pre-auth TCP server ───────────────────────────────────────────────────────
+#
+# Clients (auth_injector.dll) connect, send their token as a single line, and
+# receive auth info before joining any game server.
+#
+# Protocol (newline-terminated ASCII):
+#   Client → Server : <token>\n
+#   Server → Client : OK <username> <is_staff> <is_dev>\n
+#                  OR: FAIL\n
+
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9 '._-]{1,20}$")
+
+
+async def _setup_auth_db() -> None:
+    async with aiosqlite.connect(AUTH_DB) as db:
+        await db.executescript('''
+            CREATE TABLE IF NOT EXISTS users (
+                id               INTEGER PRIMARY KEY,
+                username         TEXT NOT NULL UNIQUE,
+                password_hash    TEXT NOT NULL DEFAULT '',
+                created_at       INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                uid              TEXT,
+                ip_address       TEXT,
+                first_connection INTEGER,
+                discord_id       TEXT UNIQUE,
+                is_staff         INTEGER NOT NULL DEFAULT 0,
+                is_dev           INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS tokens (
+                id         INTEGER PRIMARY KEY,
+                user_id    INTEGER NOT NULL,
+                token      TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                used_at    INTEGER
+            );
+        ''')
+        await db.commit()
+
+
+async def _db_get_user_by_discord(discord_id: str) -> Optional[aiosqlite.Row]:
+    async with aiosqlite.connect(AUTH_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT * FROM users WHERE discord_id = ?', (discord_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def _db_get_user_by_username(username: str) -> Optional[aiosqlite.Row]:
+    async with aiosqlite.connect(AUTH_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT * FROM users WHERE username = ?', (username,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def _db_create_user(username: str, discord_id: str) -> Optional[int]:
+    try:
+        async with aiosqlite.connect(AUTH_DB) as db:
+            cur = await db.execute(
+                'INSERT INTO users (username, password_hash, discord_id) VALUES (?, \'\', ?)',
+                (username, discord_id),
+            )
+            await db.commit()
+            return cur.lastrowid
+    except aiosqlite.IntegrityError:
+        return None
+
+
+async def _db_create_token(user_id: int, token: str) -> bool:
+    try:
+        async with aiosqlite.connect(AUTH_DB) as db:
+            # Invalidate old tokens for this user first.
+            await db.execute('DELETE FROM tokens WHERE user_id = ?', (user_id,))
+            await db.execute(
+                'INSERT INTO tokens (user_id, token) VALUES (?, ?)', (user_id, token)
+            )
+            await db.commit()
+            return True
+    except Exception:
+        return False
+
+
+async def _db_set_staff(user_id: int, value: bool) -> None:
+    async with aiosqlite.connect(AUTH_DB) as db:
+        await db.execute('UPDATE users SET is_staff = ? WHERE id = ?', (int(value), user_id))
+        await db.commit()
+
+
+async def _db_set_dev(user_id: int, value: bool) -> None:
+    async with aiosqlite.connect(AUTH_DB) as db:
+        await db.execute(
+            'UPDATE users SET is_dev = ?, is_staff = ? WHERE id = ?',
+            (int(value), int(value), user_id),
+        )
+        await db.commit()
+
+
+async def _validate_token(token: str) -> Optional[aiosqlite.Row]:
+    async with aiosqlite.connect(AUTH_DB) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            '''SELECT u.username, u.is_staff, u.is_dev
+               FROM tokens t JOIN users u ON t.user_id = u.id
+               WHERE t.token LIKE ? || '%'
+               ORDER BY length(t.token) ASC
+               LIMIT 1''',
+            (token,),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def _handle_auth_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    addr = writer.get_extra_info('peername')
+    try:
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=10)
+        except asyncio.TimeoutError:
+            return
+        token = line.decode('utf-8', errors='replace').strip()
+        if not token:
+            writer.write(b'FAIL\n')
+            await writer.drain()
+            return
+        row = await _validate_token(token)
+        if row is None:
+            auth_log.debug('Auth rejected for token %s... from %s', token[:8], addr)
+            writer.write(b'FAIL\n')
+        else:
+            auth_log.info('Auth OK: %s (staff=%d dev=%d) from %s',
+                          row['username'], row['is_staff'], row['is_dev'], addr)
+            writer.write(
+                f'OK {row["username"]} {int(row["is_staff"])} {int(row["is_dev"])}\n'.encode()
+            )
+        await writer.drain()
+    except Exception as exc:
+        auth_log.debug('Auth session error (%s): %s', addr, exc)
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def _handle_control_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    ctrl_log = logging.getLogger('control')
+    addr = writer.get_extra_info('peername')
+    ctrl_log.info('Control connection from %s', addr)
+    authed = not CONTROL_PASS
+
+    async def reply(data: dict) -> None:
+        try:
+            writer.write((json.dumps(data) + '\n').encode())
+            await writer.drain()
+        except Exception:
+            pass
+
+    try:
+        while True:
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=300)
+            except asyncio.TimeoutError:
+                break
+            if not line:
+                break
+            parts = line.decode('utf-8', errors='replace').strip().split(None, 3)
+            if not parts:
+                continue
+            cmd = parts[0].upper()
+
+            if cmd == 'AUTH':
+                pw = parts[1] if len(parts) > 1 else ''
+                authed = pw == CONTROL_PASS
+                await reply({'ok': authed} if authed else {'ok': False, 'error': 'bad password'})
+                continue
+
+            if cmd == 'QUIT':
+                break
+
+            if not authed:
+                await reply({'ok': False, 'error': 'not authenticated'})
+                continue
+
+            # ── Legacy no-ops ──────────────────────────────────────────────────
+            if cmd in ('CMD_REFRESH', 'BOT_REFRESH', 'MATCH_COMPLETE',
+                       'PURGE_CONNECTIONS', 'RESTART_MATCHMAKING', 'RESTART'):
+                await reply({'ok': True})
+
+            # ── Registration ───────────────────────────────────────────────────
+            elif cmd == 'REGISTER':
+                discord_id = parts[1] if len(parts) > 1 else ''
+                username   = ' '.join(parts[2:]).strip() if len(parts) > 2 else ''
+                if not discord_id or not username:
+                    await reply({'ok': False, 'error': 'discord_id and username required'})
+                    continue
+                if not _USERNAME_RE.match(username):
+                    await reply({'ok': False, 'error': 'invalid_username'})
+                    continue
+                if await _db_get_user_by_discord(discord_id):
+                    await reply({'ok': False, 'error': 'already_registered'})
+                    continue
+                if await _db_get_user_by_username(username):
+                    await reply({'ok': False, 'error': 'username_taken'})
+                    continue
+                user_id = await _db_create_user(username, discord_id)
+                if user_id is None:
+                    await reply({'ok': False, 'error': 'username_taken'})
+                    continue
+                token = secrets.token_hex(32)
+                if not await _db_create_token(user_id, token):
+                    await reply({'ok': False, 'error': 'token_create_failed'})
+                    continue
+                ctrl_log.info('REGISTER discord=%s username=%s', discord_id, username)
+                await reply({'ok': True, 'token': token, 'user_id': user_id})
+
+            elif cmd == 'ROTATE_TOKEN':
+                discord_id = parts[1] if len(parts) > 1 else ''
+                if not discord_id:
+                    await reply({'ok': False, 'error': 'discord_id required'})
+                    continue
+                user = await _db_get_user_by_discord(discord_id)
+                if not user:
+                    await reply({'ok': False, 'error': 'not_registered'})
+                    continue
+                token = secrets.token_hex(32)
+                if not await _db_create_token(user['id'], token):
+                    await reply({'ok': False, 'error': 'token_create_failed'})
+                    continue
+                ctrl_log.info('ROTATE_TOKEN discord=%s username=%s', discord_id, user['username'])
+                await reply({'ok': True, 'token': token, 'username': user['username']})
+
+            elif cmd == 'GRANT_STAFF':
+                discord_id = parts[1] if len(parts) > 1 else ''
+                user = await _db_get_user_by_discord(discord_id) if discord_id else None
+                if not user:
+                    await reply({'ok': False, 'error': 'not_registered'})
+                    continue
+                await _db_set_staff(user['id'], True)
+                await reply({'ok': True, 'username': user['username'], 'is_staff': True})
+
+            elif cmd == 'REVOKE_STAFF':
+                discord_id = parts[1] if len(parts) > 1 else ''
+                user = await _db_get_user_by_discord(discord_id) if discord_id else None
+                if not user:
+                    await reply({'ok': False, 'error': 'not_registered'})
+                    continue
+                await _db_set_staff(user['id'], False)
+                await reply({'ok': True, 'username': user['username'], 'is_staff': False})
+
+            elif cmd == 'GRANT_DEV':
+                discord_id = parts[1] if len(parts) > 1 else ''
+                user = await _db_get_user_by_discord(discord_id) if discord_id else None
+                if not user:
+                    await reply({'ok': False, 'error': 'not_registered'})
+                    continue
+                await _db_set_dev(user['id'], True)
+                await reply({'ok': True, 'username': user['username'], 'is_dev': True, 'is_staff': True})
+
+            elif cmd == 'REVOKE_DEV':
+                discord_id = parts[1] if len(parts) > 1 else ''
+                user = await _db_get_user_by_discord(discord_id) if discord_id else None
+                if not user:
+                    await reply({'ok': False, 'error': 'not_registered'})
+                    continue
+                await _db_set_dev(user['id'], False)
+                await reply({'ok': True, 'username': user['username'], 'is_dev': False, 'is_staff': False})
+
+            else:
+                await reply({'ok': False, 'error': f'unknown command: {cmd}'})
+
+    except Exception as exc:
+        ctrl_log.error('Control session error (%s): %s', addr, exc)
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def run_control_server() -> None:
+    server = await asyncio.start_server(_handle_control_client, CONTROL_HOST, CONTROL_PORT)
+    logging.getLogger('control').info(
+        'Control server on %s:%d  password=%s',
+        CONTROL_HOST, CONTROL_PORT, 'set' if CONTROL_PASS else 'none',
+    )
+    async with server:
+        await server.serve_forever()
+
+
+async def run_auth_server() -> None:
+    await _setup_auth_db()
+    server = await asyncio.start_server(_handle_auth_client, AUTH_HOST, AUTH_PORT)
+    auth_log.info('Pre-auth server on %s:%d  db=%s', AUTH_HOST, AUTH_PORT, AUTH_DB)
+    async with server:
+        await server.serve_forever()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 async def main() -> None:
@@ -314,6 +629,8 @@ async def main() -> None:
         local_addr=(LISTEN_HOST, LISTEN_PORT),
     )
     asyncio.ensure_future(proto.run_cleanup())
+    asyncio.ensure_future(run_auth_server())
+    asyncio.ensure_future(run_control_server())
     await asyncio.Future()
 
 

@@ -1,7 +1,18 @@
 FROM brendoncintas/spellbreak_game_server:latest
 
+# Upgrade to wine-staging (includes ESYNC) from WineHQ official repo
+RUN apt-get update && apt-get install -y --no-install-recommends wget gnupg2 software-properties-common ca-certificates && \
+    wget -qO /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key && \
+    echo "deb [signed-by=/etc/apt/keyrings/winehq-archive.key] https://dl.winehq.org/wine-builds/ubuntu/ jammy main" \
+        > /etc/apt/sources.list.d/winehq.list && \
+    apt-get update && \
+    apt-get install -y --install-recommends winehq-staging && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN pip3 install --no-cache-dir aiosqlite
 
+ENV WINEESYNC=1
+ENV WINEFSYNC=1
 ENV WINEDLLOVERRIDES=steam_api64=n,b;match_tracker.dll=n,b
 
 COPY elefrac/            /spellbreak-server/elefrac/

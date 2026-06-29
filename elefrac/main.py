@@ -3,6 +3,7 @@ import logging
 import os
 import signal
 
+from .auth_server import AuthServer
 from .ban_handler import BanHandler
 from .broadcast import BroadcastServer
 from .config import Config
@@ -28,9 +29,10 @@ async def _main() -> None:
 
     proxy = await start_proxy(cfg, db, ban_handler, match_state)
 
-    supervisor = GameSupervisor(cfg, match_state)
-    broadcast = BroadcastServer(cfg, match_state)
-    control = ControlServer(cfg, db, match_state, proxy=proxy, supervisor=supervisor)
+    supervisor  = GameSupervisor(cfg, match_state)
+    broadcast   = BroadcastServer(cfg, match_state)
+    control     = ControlServer(cfg, db, match_state, proxy=proxy, supervisor=supervisor)
+    auth_server = AuthServer(cfg, db)
 
     async def _on_match_end() -> None:
         await proxy.clear_all_sessions()
@@ -66,6 +68,7 @@ async def _main() -> None:
             supervisor.listen_for_tracker(),
             broadcast.start(),
             control.start(),
+            auth_server.start(),
             supervisor.run_idle_watchdog(),
         )
     except asyncio.CancelledError:

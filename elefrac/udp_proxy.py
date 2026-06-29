@@ -132,9 +132,11 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                     data = await self._identify_session(session, data, ip)
                     if session.kicked:
                         return
-                elif not session.uid_auth and session.username != 'unknown':
-                    # Legacy name-field auth: rewrite retransmissions so the game
-                    # server always sees the registered name, not the raw token.
+                elif not session.uid_auth and session.authenticated and session.username != 'unknown':
+                    # Name-field auth: rewrite retransmissions so the game server
+                    # always sees the registered name, not the raw token.
+                    # Only applies when the session was token-authenticated; in
+                    # require_auth=False mode unauthenticated sessions pass through as-is.
                     token, name_start, name_end, name_encoded = extract_name(data)
                     if token and token != session.username:
                         data = rewrite_name(data, name_start, name_end, session.username, name_encoded)
@@ -249,8 +251,9 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                         session.username = user['username']
                         session.user_id = user_id
                         session.uid = uid
-                        if session.username != token:
-                            data = rewrite_name(data, name_start, name_end, session.username, name_encoded)
+                        # require_auth=False: pass the original packet unchanged.
+                        # Rewriting the name field when auth is disabled corrupts
+                        # packets for clients that aren't using the auth injector.
 
         if session.user_id is not None:
             auth_tag = 'auth' if session.authenticated else 'open'
@@ -358,8 +361,9 @@ class ProxyProtocol(asyncio.DatagramProtocol):
                             user = await self._db.get_user_by_id(user_id)
                             if user:
                                 username = user['username']
-                                if username != token:
-                                    data = rewrite_name(data, name_start, name_end, username, name_encoded)
+                                # require_auth=False: pass the original packet unchanged.
+                                # Rewriting the name field when auth is disabled corrupts
+                                # packets for clients that aren't using the auth injector.
 
                 elif self._cfg.require_auth:
                     log.debug('No token in join packet from %s — dropped (require_auth)', ip)

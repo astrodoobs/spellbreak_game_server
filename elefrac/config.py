@@ -92,6 +92,12 @@ class Config:
     @property
     def tracker_push_port(self):        return self._i('MatchTracker', 'push_port', 4950)
 
+    # Auth (pre-auth at game launch)
+    @property
+    def auth_host(self):         return self._s('Auth', 'host', '0.0.0.0')
+    @property
+    def auth_port(self):         return self._i('Auth', 'port', 4948)
+
     # Broadcast
     @property
     def broadcast_host(self):   return self._s('Broadcast', 'host', '0.0.0.0')
